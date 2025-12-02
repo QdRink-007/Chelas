@@ -53,11 +53,18 @@ async function generarNuevoLinkParaDev(dev) {
   }
 
   try {
-    const res = await axios.post(
-      'https://api.mercadopago.com/checkout/preferences',
-      { items: [item] },
-      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-    );
+    const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://chelas.onrender.com/ipn';
+
+// ...
+
+const res = await axios.post(
+  'https://api.mercadopago.com/checkout/preferences',
+  {
+    items: [item],
+    notification_url: WEBHOOK_URL,   // 👈 agregado importante
+  },
+  { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+);
 
     const nuevoLink = res.data.init_point;
     const preferenceId = res.data.id;
