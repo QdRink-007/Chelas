@@ -1,3 +1,5 @@
+// index.js – Servidor QdRink multi-BAR (modo test)
+
 const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
@@ -6,15 +8,18 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-app.use(bodyParser.json());
+// ================== CONFIG ==================
 
-// ⏱️ Delay para rotar QR luego de aprobar pago (ms)
-const ROTATE_DELAY_MS = Number(process.env.ROTATE_DELAY_MS || 5000); // 5 s por defecto
+const ACCESS_TOKEN =
+  process.env.MP_ACCESS_TOKEN ||
+  'APP_USR-7589649631038780-120213-0191c78f852bf48cc77af8fc2f1be455-2163522788';
 
-// Dispositivos permitidos
+const ROTATE_DELAY_MS = Number(process.env.ROTATE_DELAY_MS || 5000); // 5s
+const WEBHOOK_URL =
+  process.env.WEBHOOK_URL || 'https://chelas.onrender.com/ipn';
+
 const ALLOWED_DEVS = ['bar1', 'bar2', 'bar3'];
 
-// Item por dispositivo (tu catálogo)
 const ITEM_BY_DEV = {
   bar1: { title: 'Pinta Rubia', quantity: 1, currency_id: 'ARS', unit_price: 100 },
   bar2: { title: 'Pinta Negra', quantity: 1, currency_id: 'ARS', unit_price: 110 },
@@ -25,169 +30,221 @@ const ITEM_BY_DEV = {
 const stateByDev = {};
 ALLOWED_DEVS.forEach(dev => {
   stateByDev[dev] = {
-    linkPago: '',
     pagado: false,
-    ultimaPreferencia: '',
+    ultimaPreferencia: null,
+    linkActual: null,
   };
 });
 
-let ultimoPaymentId = ''; // Para evitar duplicar procesamiento en IPN
+// Historial simple de pagos (también se loguea en archivo)
+const pagos = [];
 
-// 🔐 Token de producción MP
-const ACCESS_TOKEN = 'APP_USR-7589649631038780-120213-0191c78f852bf48cc77af8fc2f1be455-2163522788';
+// ================== MIDDLEWARE ==================
 
-// Historial de pagos para el panel
-let pagos = [];
+app.use(bodyParser.json());
 
-// 🛠 Helper: esperar
-function esperar(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+// ================== HELPERS MP ==================
 
-// 🔁 Generar nuevo link para un dev específico
 async function generarNuevoLinkParaDev(dev) {
   const item = ITEM_BY_DEV[dev];
-  if (!item) {
-    console.error('❌ Intento de generar link para dev desconocido:', dev);
-    return '';
-  }
+  if (!item) throw new Error(`Item no definido para dev=${dev}`);
 
-  try {
-    const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://chelas.onrender.com/ipn';
+  const headers = { Authorization: `Bearer ${ACCESS_TOKEN}` };
 
-// ...
-
-const res = await axios.post(
-  'https://api.mercadopago.com/checkout/preferences',
-  {
+  const body = {
     items: [item],
-    notification_url: WEBHOOK_URL,   // 👈 agregado importante
-  },
-  { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-);
+    external_reference: dev,       // 🔐 clave para saber a qué bar pertenece
+    notification_url: WEBHOOK_URL  // 🔔 a dónde MP envía la IPN
+  };
 
-    const nuevoLink = res.data.init_point;
-    const preferenceId = res.data.id;
+  const res = await axios.post(
+    'https://api.mercadopago.com/checkout/preferences',
+    body,
+    { headers }
+  );
 
-    stateByDev[dev].linkPago = nuevoLink;
-    stateByDev[dev].ultimaPreferencia = preferenceId;
+  const pref = res.data;
+  const prefId = pref.id || pref.preference_id;
 
-    console.log(`🔄 Nuevo link generado para ${dev}:`, {
-      preference_id: preferenceId,
-      link: nuevoLink
-    });
+  stateByDev[dev].ultimaPreferencia = prefId;
+  stateByDev[dev].linkActual = pref.init_point;
 
-    return nuevoLink;
-  } catch (error) {
-    console.error(
-      `❌ Error al generar nuevo link para ${dev}:`,
-      error.response?.data || error.message
-    );
-    return '';
-  }
-}
-
-// 🔁 Recarga automática con reintentos
-async function recargarLinkConReintento(dev, reintentos = 3) {
-  for (let intento = 1; intento <= reintentos; intento++) {
-    console.log(`⏳ [${dev}] Intento ${intento} para generar link`);
-    const nuevo = await generarNuevoLinkParaDev(dev);
-
-    if (nuevo) {
-      console.log(`✅ [${dev}] Link actualizado en intento ${intento}`);
-      return;
-    }
-
-    await esperar(5000); // espera 5 s entre intentos
-  }
-
-  console.error(`❌ [${dev}] No se pudo regenerar el link después de varios intentos`);
-}
-
-// 🧠 ESP pide link actual: /nuevo-link?dev=bar1
-app.get('/nuevo-link', async (req, res) => {
-  const dev = (req.query.dev || '').toLowerCase();
-
-  if (!ALLOWED_DEVS.includes(dev)) {
-    return res.status(400).json({ error: 'dev inválido. Usar ?dev=bar1|bar2|bar3' });
-  }
-
-  const state = stateByDev[dev];
-
-  // Si no hay link, intentamos generarlo (ej: primer uso, o fallo previo)
-  if (!state.linkPago) {
-    const nuevo = await generarNuevoLinkParaDev(dev);
-    if (!nuevo) {
-      return res.status(500).json({ error: 'No se pudo generar link de pago' });
-    }
-  }
-
-  const item = ITEM_BY_DEV[dev];
-  res.json({
-    dev,
-    link: state.linkPago,
-    title: item.title,
-    price: item.unit_price
+  console.log(`🔄 Nuevo link generado para ${dev}:`, {
+    preference_id: prefId,
+    link: pref.init_point
   });
+
+  return {
+    preference_id: prefId,
+    link: pref.init_point,
+  };
+}
+
+function recargarLinkConReintento(dev, intento = 1) {
+  const MAX_INTENTOS = 5;
+  const esperaMs = 2000 * intento;
+
+  generarNuevoLinkParaDev(dev).catch(err => {
+    console.error(`❌ Error al regenerar link para ${dev} (intento ${intento}):`,
+      err.response?.data || err.message);
+
+    if (intento < MAX_INTENTOS) {
+      console.log(`⏳ Reintentando generar link para ${dev} en ${esperaMs} ms...`);
+      setTimeout(() => recargarLinkConReintento(dev, intento + 1), esperaMs);
+    } else {
+      console.log(`⚠️ Se agotaron los reintentos para ${dev}, se mantiene el último link válido.`);
+    }
+  });
+}
+
+// ================== RUTAS PRINCIPALES ==================
+
+// Ping simple
+app.get('/', (req, res) => {
+  res.send('Servidor QdRink Chelas OK');
 });
 
-// ESP verifica si hubo pago: /estado?dev=bar1
+// Nuevo link para un dev
+app.get('/nuevo-link', async (req, res) => {
+  try {
+    const dev = (req.query.dev || '').toLowerCase();
+    if (!ALLOWED_DEVS.includes(dev)) {
+      return res.status(400).json({ error: 'dev invalido' });
+    }
+
+    const info = await generarNuevoLinkParaDev(dev);
+
+    res.json({
+      dev,
+      link: info.link,
+      title: ITEM_BY_DEV[dev].title,
+      price: ITEM_BY_DEV[dev].unit_price
+    });
+  } catch (error) {
+    console.error('❌ Error en /nuevo-link:', error.response?.data || error.message);
+    res.status(500).json({ error: 'no se pudo generar link' });
+  }
+});
+
+// Estado para ESP
 app.get('/estado', (req, res) => {
   const dev = (req.query.dev || '').toLowerCase();
-
   if (!ALLOWED_DEVS.includes(dev)) {
-    return res.status(400).json({ error: 'dev inválido. Usar ?dev=bar1|bar2|bar3' });
+    return res.status(400).json({ error: 'dev invalido' });
   }
 
-  const state = stateByDev[dev];
-  res.json({ pagado: state.pagado });
+  const st = stateByDev[dev];
 
-  // Reset para ese dispositivo solamente
-  if (state.pagado) {
-    state.pagado = false;
-  }
+  // Devolvemos y reseteamos la bandera
+  const flag = st.pagado;
+  if (flag) st.pagado = false;
+
+  res.json({ dev, pagado: flag });
 });
 
-// 📨 Mercado Pago notifica: /ipn
+// Panel web simple
+app.get('/panel', (req, res) => {
+  let html = `
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Panel QdRink TEST</title>
+      <style>
+        body { font-family: sans-serif; background:#111; color:#eee; }
+        table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+        th, td { border: 1px solid #444; padding: 6px 8px; font-size: 13px; }
+        th { background: #222; }
+        tr:nth-child(even) { background:#1b1b1b; }
+      </style>
+    </head>
+    <body>
+      <h1>Panel QdRink TEST</h1>
+      <table>
+        <tr>
+          <th>Fecha/Hora</th><th>Dev</th><th>Producto</th><th>Monto</th>
+          <th>Email</th><th>Estado</th><th>Medio</th><th>payment_id</th><th>pref_id</th>
+        </tr>
+  `;
+
+  pagos.slice().reverse().forEach(p => {
+    html += `
+      <tr>
+        <td>${p.fechaHora}</td>
+        <td>${p.dev}</td>
+        <td>${p.title}</td>
+        <td>${p.monto}</td>
+        <td>${p.email}</td>
+        <td>${p.estado}</td>
+        <td>${p.metodo}</td>
+        <td>${p.payment_id}</td>
+        <td>${p.preference_id || ''}</td>
+      </tr>
+    `;
+  });
+
+  html += `
+      </table>
+    </body>
+    </html>
+  `;
+
+  res.send(html);
+});
+
+// ================== IPN / WEBHOOK ==================
+
 app.post('/ipn', async (req, res) => {
-  const id = req.query['id'] || req.body?.data?.id;
-  const topic = req.query['topic'] || req.body?.type;
-
-  // Solo nos interesan notificaciones de pagos
-  if (topic !== 'payment') return res.sendStatus(200);
-  if (!id || id === ultimoPaymentId) return res.sendStatus(200);
-  ultimoPaymentId = id;
-
   try {
-    const response = await axios.get(
-      `https://api.mercadopago.com/v1/payments/${id}`,
-      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-    );
+    console.log('📥 IPN recibida:', { query: req.query, body: req.body });
 
-    const estado = response.data.status;
-    const preference_id = response.data.preference_id;
-    const email = response.data.payer?.email || 'sin email';
-    const monto = response.data.transaction_amount;
-    const metodo = response.data.payment_method_id;
-    const descripcion = response.data.description;
+    // MP puede mandar el id en varios campos
+    const paymentId =
+      req.query['data.id'] ||
+      req.body['data.id'] ||
+      req.body?.data?.id ||
+      req.query.id ||
+      req.body.id;
 
-    console.log('📩 Pago recibido:', { estado, email, monto, metodo, descripcion });
+    if (!paymentId) {
+      console.log('⚠️ IPN sin payment_id. Nada que hacer.');
+      return res.sendStatus(200);
+    }
+
+    const headers = { Authorization: `Bearer ${ACCESS_TOKEN}` };
+    const url = `https://api.mercadopago.com/v1/payments/${paymentId}`;
+
+    const mpRes = await axios.get(url, { headers });
+    const data = mpRes.data;
+
+    const estado = data.status;
+    const email = data.payer?.email || 'sin email';
+    const monto = data.transaction_amount;
+    const metodo = data.payment_method_id;
+    const descripcion = data.description;
+    const externalRef = data.external_reference || null;
+    const preference_id = data.preference_id || null;
+
+    console.log('📩 Pago recibido:', {
+      estado,
+      email,
+      monto,
+      metodo,
+      descripcion,
+      externalRef,
+    });
     console.log('🔎 preference_id del pago:', preference_id);
 
-    // Buscar a qué dev corresponde esta preference_id
-    const dev = ALLOWED_DEVS.find(d => stateByDev[d].ultimaPreferencia === preference_id);
+    // 🔐 ACÁ usamos external_reference para saber qué BAR es
+    const dev = ALLOWED_DEVS.includes(externalRef) ? externalRef : null;
+    console.log('🔐 dev detectado por external_reference:', dev || 'ninguno');
 
-    console.log('🔐 preference_id esperado por dev:', dev || 'ninguno');
-
-    // FILTRO CRÍTICO:
-    // Solo consideramos pago válido si:
-    // - está aprobado
-    // - corresponde a una preference_id actual de alguno de los dev
     if (estado === 'approved' && dev) {
-      const state = stateByDev[dev];
-      state.pagado = true;
+      const st = stateByDev[dev];
+      st.pagado = true;
 
-      const fechaHora = new Date().toLocaleString();
+      const fechaHora = new Date().toLocaleString('es-AR', {
+        timeZone: 'America/Argentina/Buenos_Aires',
+      });
 
       console.log(`✅ Pago confirmado y válido para ${dev}`);
 
@@ -197,11 +254,11 @@ app.post('/ipn', async (req, res) => {
         email,
         estado,
         monto,
-        preference_id,
-        payment_id: id,
         metodo,
         descripcion,
-        title: ITEM_BY_DEV[dev].title
+        payment_id: paymentId,
+        preference_id,
+        title: ITEM_BY_DEV[dev].title,
       };
 
       pagos.push(registro);
@@ -212,104 +269,33 @@ app.post('/ipn', async (req, res) => {
         ` | Monto: ${monto}` +
         ` | Pago de: ${email}` +
         ` | Estado: ${estado}` +
+        ` | externalRef: ${externalRef}` +
         ` | pref: ${preference_id}` +
-        ` | id: ${id}\n`;
+        ` | id: ${paymentId}\n`;
 
-      console.log(logMsg);
       fs.appendFileSync('pagos.log', logMsg);
 
-      // Luego de un delay, generamos nuevo link SOLO para ese dev
+      // Programar rotación de QR para este dev
       setTimeout(() => {
         recargarLinkConReintento(dev);
       }, ROTATE_DELAY_MS);
     } else {
-      console.log('⚠️ Pago aprobado pero NO corresponde a ninguna preference_id activa. Ignorado.');
+      console.log('⚠️ Pago aprobado pero NO corresponde a ningún dev QdRink. Ignorado.');
     }
 
     res.sendStatus(200);
   } catch (error) {
-    console.error('❌ Error al consultar pago:', error.response?.data || error.message);
-    res.sendStatus(500);
+    console.error('❌ Error en /ipn:', error.response?.data || error.message);
+    res.sendStatus(200); // para que MP no reintente infinito
   }
 });
 
-// 📊 Panel web para ver pagos
-app.get('/panel', (req, res) => {
-  const filas = pagos
-    .map(p => {
-      return `
-        <tr>
-          <td>${p.fechaHora}</td>
-          <td>${p.dev}</td>
-          <td>${p.title}</td>
-          <td>${p.monto}</td>
-          <td>${p.email}</td>
-          <td>${p.estado}</td>
-          <td>${p.payment_id}</td>
-        </tr>
-      `;
-    })
-    .join('');
-
-  const html = `
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>QdRink - Panel de Pagos</title>
-    <style>
-      body { font-family: sans-serif; background: #111; color: #eee; padding: 20px; }
-      h1 { color: #0f0; }
-      table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-      th, td { border: 1px solid #444; padding: 8px; text-align: left; font-size: 14px; }
-      th { background: #222; }
-      tr:nth-child(even) { background: #1a1a1a; }
-      .chip { display: inline-block; padding: 4px 8px; border-radius: 4px; background: #222; margin-right: 8px; }
-    </style>
-  </head>
-  <body>
-    <h1>🧃 QdRink - Pagos Recibidos</h1>
-
-    <div class="chip">Dispositivos: ${ALLOWED_DEVS.join(', ')}</div>
-    <div class="chip">Pagos registrados: <b>${pagos.length}</b></div>
-
-    <table>
-      <thead>
-        <tr>
-          <th>Fecha / Hora</th>
-          <th>Dev</th>
-          <th>Producto</th>
-          <th>Monto</th>
-          <th>Email</th>
-          <th>Estado</th>
-          <th>Payment ID</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${filas || '<tr><td colspan="7">Sin pagos aún.</td></tr>'}
-      </tbody>
-    </table>
-  </body>
-  </html>
-  `;
-
-  res.send(html);
-});
-
-// Redirigir raíz al panel
-app.get('/', (req, res) => {
-  res.redirect('/panel');
-});
-
-// Inicial: podés pre-generar QRs o dejar que se generen on-demand
-(async () => {
-  console.log('🚀 Servidor iniciando...');
-  // Si querés precalentar, descomentá:
-  // for (const dev of ALLOWED_DEVS) {
-  //   await recargarLinkConReintento(dev);
-  // }
-})();
+// ================== ARRANQUE ==================
 
 app.listen(PORT, () => {
   console.log(`Servidor activo en http://localhost:${PORT}`);
-});  
+  console.log('Generando links iniciales por cada dev...');
+  ALLOWED_DEVS.forEach(dev => {
+    recargarLinkConReintento(dev);
+  });
+});
