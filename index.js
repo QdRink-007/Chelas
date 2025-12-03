@@ -1,4 +1,4 @@
-// index.js – Servidor QdRink multi-BAR (modo TEST en chelas)
+/ index.js – Servidor QdRink multi-BAR (modo TEST en chelas)
 
 const express = require('express');
 const axios = require('axios');
@@ -33,6 +33,7 @@ ALLOWED_DEVS.forEach((dev) => {
     pagado: false,
     ultimaPreferencia: null,
     linkActual: null,
+    rotateScheduled: false, // 👈 nuevo: evita rotaciones duplicadas
   };
 });
 
@@ -54,7 +55,7 @@ async function generarNuevoLinkParaDev(dev) {
 
   const body = {
     items: [item],
-    external_reference: dev, // para saber a qué BAR pertenece el pago
+    external_reference: dev, // identifica al BAR
     notification_url: WEBHOOK_URL,
   };
 
@@ -210,7 +211,7 @@ app.post('/ipn', async (req, res) => {
       req.body.topic ||
       req.body.type;
 
-    // Ignorar todo lo que NO sea payment (merchant_order, etc.)
+    // Ignoramos merchant_order y cualquier cosa que no sea "payment"
     if (topic && topic !== 'payment') {
       console.log('ℹ️ IPN de tipo no-payment, se ignora:', topic);
       return res.sendStatus(200);
@@ -307,9 +308,18 @@ app.post('/ipn', async (req, res) => {
 
       fs.appendFileSync('pagos.log', logMsg);
 
-      setTimeout(() => {
-        recargarLinkConReintento(dev);
-      }, ROTATE_DELAY_MS);
+      // Programar rotación de QR SOLO si aún no hay una agendada
+      if (!st.rotateScheduled) {
+        st.rotateScheduled = true;
+        setTimeout(() => {
+          recargarLinkConReintento(dev);
+          st.rotateScheduled = false;
+        }, ROTATE_DELAY_MS);
+      } else {
+        console.log(
+          `ℹ️ Rotación de QR ya agendada para ${dev}, no se agenda otra.`,
+        );
+      }
     } else {
       console.log(
         '⚠️ Pago aprobado pero NO corresponde a ningún dev QdRink. Ignorado.',
