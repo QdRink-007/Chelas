@@ -1,4 +1,4 @@
-/ index.js – Servidor QdRink multi-BAR (modo TEST en chelas)
+// index.js – Servidor QdRink multi-BAR (modo TEST en chelas)
 
 const express = require('express');
 const axios = require('axios');
